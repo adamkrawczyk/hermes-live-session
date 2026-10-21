@@ -12,8 +12,9 @@ refusal, and without interrupting the turn that is running.
                                         and any /goal that is PAUSED or STALLED
     hermes live steer <id> "text"       inject into the RUNNING turn after its next tool batch
     hermes live queue <id> "text"       run as the next turn and print the reply
-    hermes live attach <id>             interactive live view (/detach leaves the view,
-                                        /stop interrupts, /approve and /answer resolve prompts)
+    hermes live attach <id>             interactive live view: Enter steers a running turn,
+                                        or runs the next turn when idle (/queue, /steer,
+                                        /stop, /detach; /approve and /answer resolve prompts)
     hermes live continue [<id>]         keep a /goal running in the gateway after its terminal
                                         left (default: the session this terminal just left)
 
@@ -36,7 +37,7 @@ You started a long `/goal` over SSH from PC A and are now on PC B:
     ssh my-hermes-host
     hermes live ls                           # find it: 7d3a9  [working]  Ship the release ...
     hermes live steer 7d3a9 "also update the changelog"
-    hermes live attach 7d3a9                 # watch it; /detach to leave the view
+    hermes live attach 7d3a9                 # watch it; type to steer; /detach to leave the view
 
 ### Leaving a classic-CLI session so its goal keeps running
 
@@ -71,9 +72,23 @@ and refuses a second `hermes --resume`. These commands speak the gateway protoco
 |------------|--------|
 | `steer`    | Accepted as `queued` (fenced by `execution_generation`); arrives as an out-of-band user message after the agent's next tool batch. On an idle session: exit 3, nothing sent. |
 | `queue`    | Waits behind the running turn, then runs as the next turn. Ctrl+C detaches; the turn still runs. |
-| `attach`   | Streams the session live: tool calls, replies, approvals. |
+| `attach`   | Streams the session live: tool calls, replies, approvals. A line typed while a turn runs is a `steer` (shown as `↪ steered`); typed while idle, or if the turn ends first (`rejected`), it runs as the next turn. `/steer <text>` never queues, `/queue <text>` never steers. |
 | `continue` | Exit 3 when there is no active or paused goal. Never resets the turn budget. |
 | `ls`       | Read-only. `[WAITING]` means blocked on an approval or a question. |
+
+### What `attach` is, and is not
+
+`attach` is the gateway's own live view (`GatewayChatView`, the screen `hermes chat` uses on the
+unified runtime), not a second copy of the classic CLI window. It is the same session, with the
+same history, tools and approvals, on a simpler screen with fewer commands (`/help` lists them).
+The bottom bar says `⚡ live attach` and whether a turn is running. A full classic-CLI attach needs
+the owning terminal to share its runtime, which is upstream
+[#113486](https://github.com/NousResearch/hermes-agent/pull/113486).
+
+As shipped, that view sends every typed line as a new turn, which waits behind the running one,
+and refuses `/steer`. `attach` therefore routes typed lines the way core's own client does
+(`hermes_cli.gateway_agent._correct`): `session.steer` fenced by `execution_generation` first,
+then the same line as the next turn when nothing is running.
 
 ## What it touches (disclosure)
 
@@ -88,7 +103,11 @@ and refuses a second `hermes --resume`. These commands speak the gateway protoco
   `continue` resumes a paused goal. Nothing else is written.
 - **Core imports:** `hermes_cli.gateway_client`, `hermes_cli.gateway_chat` and
   `hermes_cli.active_sessions` are not documented plugin APIs yet, so `hermes plugins validate`
-  warns about them. The plugin rebinds nothing in core.
+  warns about them. The only rebinding: while `hermes live attach` runs, and only inside that
+  short-lived process, `hermes_cli.gateway_chat_view.GatewayChatView` names a subclass that adds
+  the steer-first routing. It is restored on every exit path. The gateway and other terminals are
+  untouched. On a build whose viewer lacks the hooks it needs, `attach` says so and uses the stock
+  view.
 
 ## Retire when
 

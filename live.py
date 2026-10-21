@@ -11,7 +11,8 @@ never interrupt the running turn:
               goal that is paused or stalled
     steer     session.steer, delivered after the agent's next tool batch, no interrupt
     queue     prompt.submit, waits behind the running turn, prints the reply
-    attach    the gateway's interactive viewer (GatewayChatView): /detach, /stop, /approve
+    attach    the gateway's interactive viewer (GatewayChatView) with steer-first typing:
+              Enter steers a running turn, or runs the next one when idle; /queue, /steer, /stop
     continue  hand a goal to the gateway after its terminal left (resume + one admitted turn)
 
 Superseded when upstream ships `hermes steer` / `hermes queue` (PR #132798), cooperative
@@ -447,6 +448,177 @@ def _gateway_launch(options: dict[str, Any]) -> int:
     return launch_from_kwargs(options)
 
 
+# ------------------------------------------------------------------------- attach view
+#
+# `attach` runs the shipped gateway viewer (GatewayChatView), not the classic CLI. As shipped, that
+# viewer sends every typed line through prompt.submit, so text typed while a turn runs waits behind
+# the turn and runs AFTER it, and its /steer is refused ("not available on the shared gateway yet").
+# For attach, the point of which is driving a running session, that is the wrong default. The
+# subclass below routes a typed line exactly the way core's own client does
+# (hermes_cli.gateway_agent._correct): session.steer fenced by execution_generation first; on
+# `rejected` or any refusal (no turn running, the turn just ended), the same line becomes the next
+# turn. Only plain lines typed at the main composer are rerouted: slash commands, the /model confirm
+# prompt and skill/command directives keep the stock path.
+
+PREVIEW = 80
+
+ATTACH_HELP = (
+    "hermes live attach: Enter while a turn runs = steer it (lands after the agent's next tool batch); "
+    "Enter while idle = the next turn.\n"
+    "/steer <text> steer only (never queues), /queue <text> next turn only (never steers), "
+    "/stop interrupt, /detach leave it running.")
+
+
+def steer_verdict(result: Any) -> str:
+    """Core's client contract (``hermes_cli.gateway_agent._correct``): ``steered`` when the running turn
+    took the text, ``voice_stopped`` when the owner consumed it as a voice-chat stop phrase (nothing
+    to send), else ``not_taken`` (``rejected``, no result, a refusal): the caller may queue it."""
+    if isinstance(result, dict) and result.get("voice_stopped") is True:
+        return "voice_stopped"
+    if isinstance(result, dict) and result.get("status") in ("queued", "redirected"):
+        return "steered"
+    return "not_taken"
+
+
+def _preview(text: str) -> str:
+    line = " ".join(text.split())
+    return line if len(line) <= PREVIEW else line[:PREVIEW - 1] + "…"
+
+
+def make_attach_view(base: type) -> type:
+    """``base`` (the shipped GatewayChatView) with attach's steer-first input routing."""
+
+    class LiveAttachView(base):  # type: ignore[misc, valid-type]
+        def __init__(self, client, snapshot, *args, **kwargs):
+            super().__init__(client, snapshot, *args, **kwargs)
+            # Display only (the toolbar). Routing never trusts it: the gateway decides per line.
+            self.live_running = bool((snapshot or {}).get("running"))
+            self.live_confirming = False
+            self.live_dressed = False
+
+        async def try_steer(self, text: str) -> str:
+            try:
+                result = await self.client.rpc("session.steer", session_id=self.session_id, text=text,
+                                               execution_generation=int(self.generation or 0))
+            except Exception:  # noqa: BLE001 - core's contract: any refusal = not taken, caller queues
+                return "not_taken"
+            return steer_verdict(result)
+
+        async def route_line(self, text: str) -> str:
+            """A plain line typed at the composer: steer the running turn, else run it as the next."""
+            verdict = await self.try_steer(text)
+            if verdict == "steered":
+                print(f"\u21aa steered into the running turn: {_preview(text)}\n"
+                      "  (the agent sees it after its next tool batch)", flush=True)
+                return verdict
+            if verdict == "voice_stopped":
+                return verdict
+            print(f"\n{'─' * 40}\n● {text}", flush=True)
+            print("  (no turn was running to steer: queued as the next turn)", flush=True)
+            await self.submit(text)
+            return "queued"
+
+        async def command(self, text):
+            command, _, rest = text.partition(" ")
+            rest = rest.strip()
+            if command == "/steer":
+                if not rest:
+                    print("Usage: /steer <text>")
+                    return True
+                verdict = await self.try_steer(rest)
+                if verdict == "steered":
+                    print(f"\u21aa steered into the running turn: {_preview(rest)}", flush=True)
+                elif verdict == "not_taken":
+                    print("No turn is running, so nothing was steered or sent. Type the text plainly "
+                          "(or /queue <text>) to run it as the next turn.", flush=True)
+                return True
+            if command == "/queue":
+                if not rest:
+                    print("Usage: /queue <text>")
+                    return True
+                print(f"\n{'─' * 40}\n● {rest}", flush=True)
+                await self.submit(rest)
+                return True
+            if command == "/help":
+                print(ATTACH_HELP)
+            return await super().command(text)
+
+        async def _confirm_model_switch(self, refusal):
+            self.live_confirming = True
+            try:
+                return await super()._confirm_model_switch(refusal)
+            finally:
+                self.live_confirming = False
+
+        def _dispatch_event(self, kind, admission, payload):
+            if kind in ("message.delta", "tool.start", "tool.complete"):
+                self.live_running = True
+            elif kind == "message.complete":
+                self.live_running = False
+            return super()._dispatch_event(kind, admission, payload)
+
+        def toolbar(self) -> str:
+            state = "\u25cf running: Enter steers" if self.live_running else "\u25cb idle: Enter = next turn"
+            return (f" \u26a1 live attach \u2502 {self.model} \u2502 {_short(self.session_id)} \u2502 {state} "
+                    "\u2502 /queue /steer /stop /detach ")
+
+        def dress(self, prompt) -> None:
+            if prompt is None or self.live_dressed:
+                return
+            self.live_dressed = True
+            try:  # PromptSession reads both attributes on every render / prompt call
+                prompt.bottom_toolbar = self.toolbar
+                prompt.refresh_interval = 0.5
+            except Exception:  # noqa: BLE001 - cosmetic; routing does not depend on it
+                pass
+
+        async def _read_line(self, prompt, symbol):
+            self.dress(prompt)
+            line = await super()._read_line(prompt, symbol)
+            text = (line or "").strip()
+            if self.live_confirming or self.failure or not text or text.startswith("/"):
+                return line
+            from hermes_cli.gateway_client import GatewayClientError
+            try:
+                await self.route_line(text)
+            except GatewayClientError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+            return ""  # handled: the stock loop skips an empty line and reads the next one
+
+    LiveAttachView.__name__ = LiveAttachView.__qualname__ = "LiveAttachView"
+    return LiveAttachView
+
+
+ATTACH_VIEW_HOOKS = ("_read_line", "command", "submit", "_dispatch_event", "_confirm_model_switch")
+
+
+def attach_view_supported(base: Any) -> bool:
+    return isinstance(base, type) and all(callable(getattr(base, name, None)) for name in ATTACH_VIEW_HOOKS)
+
+
+def launch_attach(sid: str, launch: Callable[[dict[str, Any]], int] = _gateway_launch) -> int:
+    """Run the gateway viewer with attach's view class, in THIS process only, for this call only.
+
+    ``run_gateway_chat`` imports GatewayChatView from its module at call time, so the swap is seen
+    there; it is undone on every exit path. The gateway and every other terminal are untouched."""
+    import hermes_cli.gateway_chat as chat
+    import hermes_cli.gateway_chat_view as view_mod
+    base = view_mod.GatewayChatView
+    if not attach_view_supported(base):
+        print("hermes live: this Hermes build's viewer lacks the hooks attach needs; typed text will "
+              "QUEUE (not steer). Use `hermes live steer` from another shell.", file=sys.stderr)
+        return launch({"resume": sid})
+    patched = make_attach_view(base)
+    targets = [view_mod] + ([chat] if getattr(chat, "GatewayChatView", None) is base else [])
+    for mod in targets:
+        setattr(mod, "GatewayChatView", patched)  # noqa: B010 - module attrs are untyped to Pyright
+    try:
+        return launch({"resume": sid})
+    finally:
+        for mod in targets:
+            setattr(mod, "GatewayChatView", base)  # noqa: B010
+
+
 # ------------------------------------------------------------------------------ commands
 
 def _discover(gw_needed: bool = True):
@@ -520,9 +692,11 @@ def cmd_attach(args) -> int:
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         raise LiveError("attach needs an interactive terminal.", EXIT_USAGE)
     sid = _resolve(args.session)
-    print(f"Attaching to {_short(sid)}. Typing queues a turn; /detach (or Ctrl+C) leaves it running; "
-          "/stop interrupts it.", file=sys.stderr)
-    return _gateway_launch({"resume": sid})
+    print(f"Attaching to {_short(sid)} through the gateway. This is the gateway's live view, not the "
+          "classic CLI window: same session, simpler screen, fewer commands (/help lists them).\n"
+          "Enter while a turn runs steers it; Enter while idle runs the next turn. /queue <text> waits "
+          "for the next turn, /stop interrupts, /detach (or Ctrl+C) leaves it running.", file=sys.stderr)
+    return launch_attach(sid)
 
 
 def default_goal_session(model: dict[str, dict[str, Any]], crumbs: dict[str, tuple[str, float]],

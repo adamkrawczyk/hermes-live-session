@@ -40,7 +40,7 @@ def register(ctx) -> None:
             "  hermes live ls                      what runs, who views it, from which tty / SSH IP\n"
             "  hermes live steer <id> \"text\"       inject after the next tool batch\n"
             "  hermes live queue <id> \"text\"       run as the next turn, print the reply\n"
-            "  hermes live attach <id>             live view; /detach leaves the view\n"
+            "  hermes live attach <id>             live view; type to steer, /detach leaves it\n"
             "  hermes live continue [<id>]         keep a /goal running after its terminal quit\n\n"
             "<id> = full session id, a unique prefix (e.g. 7d3a9), or the exact title."
         ),
