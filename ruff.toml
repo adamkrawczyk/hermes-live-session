@@ -1,0 +1,6 @@
+# Pinned in CI (.github/workflows/ci.yml) to the same ruff version, so local and CI agree.
+line-length = 120
+target-version = "py312"
+
+[lint]
+extend-select = ["B", "BLE", "UP"]

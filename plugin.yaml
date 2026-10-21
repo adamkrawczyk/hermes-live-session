@@ -1,0 +1,14 @@
+name: live-session
+version: "1.0.0"
+description: >-
+  `hermes live {ls,steer,queue,attach,continue}`: see, steer, queue into, watch and keep running
+  a session that another terminal owns (for example your SSH login from another PC), through the
+  gateway, without the classic CLI's "open in another Hermes window/terminal" refusal and without
+  interrupting the running turn. `hermes live continue` keeps a /goal running after its terminal
+  quits.
+author: adamkrawczyk
+kind: standalone
+requires_hermes: ">=0.22.2"
+platforms:
+  - linux
+  - macos
