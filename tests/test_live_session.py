@@ -363,6 +363,215 @@ def test_handle_on_supported_build_dispatches():
     assert code == live.EXIT_OK and ran == ["ls"]
 
 
+# ----------------------------------------------------------------------- attach view routing
+
+class _RPCRefused(Exception):
+    pass
+
+
+class SteerClient:
+    """Records RPCs; ``steer`` is the session.steer reply (or an exception to raise)."""
+
+    def __init__(self, steer):
+        self.steer, self.calls = steer, []
+
+    async def rpc(self, method, **params):
+        self.calls.append((method, params))
+        if method == "session.steer":
+            if isinstance(self.steer, Exception):
+                raise self.steer
+            return self.steer
+        return {}
+
+
+class FakeBaseView:
+    """The GatewayChatView surface attach subclasses (hermes_cli/gateway_chat_view.py)."""
+
+    def __init__(self, client, snapshot, **_kw):
+        self.client, self.session_id = client, snapshot["stored_session_id"]
+        self.generation, self.model, self.failure = snapshot.get("execution_generation", 0), "m", None
+        self.submitted, self.base_commands, self.lines, self.dispatched = [], [], [], []
+
+    async def _read_line(self, prompt, symbol):
+        return self.lines.pop(0)
+
+    async def submit(self, text):
+        self.submitted.append(text)
+        return {"admission_id": "adm"}
+
+    async def command(self, text):
+        self.base_commands.append(text)
+        return text not in ("/detach", "/quit")
+
+    async def _confirm_model_switch(self, refusal):
+        return await self._read_line(None, "confirm? ")
+
+    def _dispatch_event(self, kind, admission, payload):
+        self.dispatched.append(kind)
+
+
+class FakePrompt:
+    bottom_toolbar: Any = None
+    refresh_interval: float = 0
+
+
+def _view(steer, running=True, generation=7):
+    cls = live.make_attach_view(FakeBaseView)
+    snap = {"stored_session_id": A, "execution_generation": generation, "running": running}
+    return cls(SteerClient(steer), snap)
+
+
+def _with_fake_core(fn):
+    """Run ``fn`` with fake hermes_cli modules in sys.modules (CI has no Hermes)."""
+    import types
+    names = ("hermes_cli", "hermes_cli.gateway_client", "hermes_cli.gateway_chat", "hermes_cli.gateway_chat_view")
+    saved = {n: sys.modules.get(n) for n in names}
+    mods = {n: types.ModuleType(n) for n in names}
+    setattr(mods["hermes_cli.gateway_client"], "GatewayClientError", _RPCRefused)  # noqa: B010
+    setattr(mods["hermes_cli.gateway_chat_view"], "GatewayChatView", FakeBaseView)  # noqa: B010
+    sys.modules.update(mods)
+    try:
+        return fn(mods)
+    finally:
+        for n, m in saved.items():
+            if m is None:
+                sys.modules.pop(n, None)
+            else:
+                sys.modules[n] = m
+
+
+def test_steer_verdict_mirrors_core_client_contract():
+    assert live.steer_verdict({"status": "queued"}) == "steered"
+    assert live.steer_verdict({"status": "redirected"}) == "steered"
+    assert live.steer_verdict({"status": "rejected", "delivered": False}) == "not_taken"
+    assert live.steer_verdict(None) == "not_taken" and live.steer_verdict("queued") == "not_taken"
+    assert live.steer_verdict({"voice_stopped": True, "status": "queued"}) == "voice_stopped"
+
+
+def test_attach_plain_line_while_running_steers_fenced_and_never_queues():
+    def run(_mods):
+        v = _view({"status": "queued"})
+        v.lines = ["  also update the changelog  "]
+        assert asyncio.run(v._read_line(FakePrompt(), "> ")) == ""  # handled: stock loop reads on
+        return v
+    v = _with_fake_core(run)
+    assert v.client.calls == [("session.steer", {"session_id": A, "text": "also update the changelog",
+                                                 "execution_generation": 7})]
+    assert v.submitted == []
+
+
+def test_attach_plain_line_when_rejected_or_refused_becomes_next_turn():
+    for reply in ({"status": "rejected", "delivered": False}, _RPCRefused("stale_generation"), None):
+        def run(_mods, reply=reply):
+            v = _view(reply, running=False)
+            v.lines = ["next thing"]
+            assert asyncio.run(v._read_line(FakePrompt(), "> ")) == ""
+            return v
+        v = _with_fake_core(run)
+        assert v.submitted == ["next thing"], reply
+        assert [c[0] for c in v.client.calls] == ["session.steer"]
+
+
+def test_attach_voice_stop_is_consumed_not_queued():
+    def run(_mods):
+        v = _view({"voice_stopped": True})
+        v.lines = ["stop"]
+        assert asyncio.run(v._read_line(None, "> ")) == ""
+        return v
+    v = _with_fake_core(run)
+    assert v.submitted == [] and len(v.client.calls) == 1
+
+
+def test_attach_slash_lines_empty_lines_and_confirm_prompt_keep_stock_path():
+    def run(_mods):
+        v = _view({"status": "queued"})
+        v.lines = ["/stop", "   ", "once"]
+        assert asyncio.run(v._read_line(None, "> ")) == "/stop"
+        assert asyncio.run(v._read_line(None, "> ")) == "   "
+        assert asyncio.run(v._confirm_model_switch("refused")) == "once"  # the /model confirm answer
+        assert v.live_confirming is False
+        return v
+    v = _with_fake_core(run)
+    assert v.client.calls == [] and v.submitted == []
+
+
+def test_attach_failed_stream_returns_line_untouched():
+    def run(_mods):
+        v = _view({"status": "queued"})
+        v.failure, v.lines = RuntimeError("gone"), ["typed"]
+        assert asyncio.run(v._read_line(None, "> ")) == "typed"
+        return v
+    assert _with_fake_core(run).client.calls == []
+
+
+def test_attach_slash_steer_never_queues_and_slash_queue_never_steers():
+    def run(_mods):
+        idle = _view({"status": "rejected"}, running=False)
+        assert asyncio.run(idle.command("/steer do it")) is True
+        assert idle.submitted == [] and idle.base_commands == []
+        busy = _view({"status": "queued"})
+        assert asyncio.run(busy.command("/queue later please")) is True
+        assert busy.submitted == ["later please"] and busy.client.calls == []
+        assert asyncio.run(busy.command("/steer")) is True and busy.client.calls == []  # usage only
+        assert asyncio.run(busy.command("/detach")) is False  # stock controls still reach the base
+        return idle
+    idle = _with_fake_core(run)
+    assert idle.client.calls[0][1]["text"] == "do it"
+
+
+def test_attach_toolbar_tracks_running_from_events_and_dresses_prompt_once():
+    v = _view({}, running=False)
+    p = FakePrompt()
+    v.dress(p)
+    assert p.bottom_toolbar == v.toolbar and p.refresh_interval == 0.5
+    assert "idle" in v.toolbar()
+    v._dispatch_event("tool.start", "a", {})
+    assert v.live_running and "running" in v.toolbar() and v.dispatched == ["tool.start"]
+    v._dispatch_event("message.complete", "a", {})
+    assert not v.live_running
+    p.bottom_toolbar = "other"
+    v.dress(p)
+    assert p.bottom_toolbar == "other"  # once only
+
+
+def test_launch_attach_swaps_view_for_the_call_and_restores_on_error():
+    def run(mods):
+        seen = []
+
+        def launch(opts):
+            seen.append((opts, mods["hermes_cli.gateway_chat_view"].GatewayChatView.__name__))
+            raise KeyboardInterrupt
+        try:
+            live.launch_attach(A, launch=launch)
+        except KeyboardInterrupt:
+            pass
+        assert seen == [({"resume": A}, "LiveAttachView")]
+        assert mods["hermes_cli.gateway_chat_view"].GatewayChatView is FakeBaseView
+        # a build that imported the view at module top is swapped (and restored) there too
+        mods["hermes_cli.gateway_chat"].GatewayChatView = FakeBaseView
+        names = []
+        assert live.launch_attach(A, launch=lambda o: names.append(
+            mods["hermes_cli.gateway_chat"].GatewayChatView.__name__) or 5) == 5
+        assert names == ["LiveAttachView"]
+        assert mods["hermes_cli.gateway_chat"].GatewayChatView is FakeBaseView
+    _with_fake_core(run)
+
+
+def test_launch_attach_falls_back_to_stock_view_when_hooks_moved():
+    class Bare:
+        async def submit(self, text):
+            return None
+
+    def run(mods):
+        mods["hermes_cli.gateway_chat_view"].GatewayChatView = Bare
+        used = []
+        assert live.launch_attach(A, launch=lambda o: used.append(
+            mods["hermes_cli.gateway_chat_view"].GatewayChatView) or 0) == 0
+        assert used == [Bare]
+    assert not live.attach_view_supported(Bare) and live.attach_view_supported(FakeBaseView)
+    _with_fake_core(run)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0
