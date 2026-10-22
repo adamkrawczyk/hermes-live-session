@@ -802,8 +802,7 @@ def setup_parser(parser) -> None:
 
 
 UPDATE_HINT = ("this Hermes build predates the unified gateway runtime that `hermes live` drives "
-               "(missing: {missing}). Update Hermes (`hermes update`); the first release that "
-               "carries it is the one after v0.22.2.")
+               "(missing: {missing}). Update Hermes (`hermes update`); that runtime shipped in v0.22.2.")
 
 # Core entry points this plugin uses; all are lazy so `hermes --help` never pays for them.
 REQUIRED_CORE = (
