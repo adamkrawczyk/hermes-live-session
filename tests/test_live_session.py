@@ -534,27 +534,121 @@ def test_attach_toolbar_tracks_running_from_events_and_dresses_prompt_once():
     assert p.bottom_toolbar == "other"  # once only
 
 
-def test_launch_attach_swaps_view_for_the_call_and_restores_on_error():
+def test_launch_attach_runs_its_own_subclass_and_never_rebinds_core():
     def run(mods):
         seen = []
 
-        def launch(opts):
-            seen.append((opts, mods["hermes_cli.gateway_chat_view"].GatewayChatView.__name__))
-            raise KeyboardInterrupt
-        try:
-            live.launch_attach(A, launch=launch)
-        except KeyboardInterrupt:
-            pass
-        assert seen == [({"resume": A}, "LiveAttachView")]
-        assert mods["hermes_cli.gateway_chat_view"].GatewayChatView is FakeBaseView
-        # a build that imported the view at module top is swapped (and restored) there too
-        mods["hermes_cli.gateway_chat"].GatewayChatView = FakeBaseView
-        names = []
-        assert live.launch_attach(A, launch=lambda o: names.append(
-            mods["hermes_cli.gateway_chat"].GatewayChatView.__name__) or 5) == 5
-        assert names == ["LiveAttachView"]
-        assert mods["hermes_cli.gateway_chat"].GatewayChatView is FakeBaseView
+        async def fake_run(sid, cls):
+            # core's name is untouched WHILE attach runs, not only after (catalog rule 9)
+            seen.append((sid, cls, mods["hermes_cli.gateway_chat_view"].GatewayChatView))
+            return 5
+
+        def stock_launch(_opts):
+            raise AssertionError("a supported build must not take the stock path")
+        assert live.launch_attach(A, launch=stock_launch, run=fake_run) == 5
+        (sid, cls, during), = seen
+        assert sid == A and cls.__name__ == "LiveAttachView" and issubclass(cls, FakeBaseView)
+        assert during is FakeBaseView and mods["hermes_cli.gateway_chat_view"].GatewayChatView is FakeBaseView
+        assert not hasattr(mods["hermes_cli.gateway_chat"], "GatewayChatView")
     _with_fake_core(run)
+
+
+def test_live_never_rebinds_a_core_module_attribute():
+    """Catalog rule 9 at the source: no setattr()/attribute assignment onto anything imported
+    from Hermes core, and no sys.modules writes for core names."""
+    import ast
+    tree = ast.parse(Path(str(live.__file__)).read_text())
+    core_names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] in ("hermes_cli", "agent", "gateway"):
+            core_names.update(a.asname or a.name for a in node.names)
+        if isinstance(node, ast.Import):
+            core_names.update((a.asname or a.name).split(".")[0] for a in node.names
+                              if a.name.split(".")[0] in ("hermes_cli", "agent", "gateway"))
+    bad = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "setattr":
+            bad.append(f"setattr at line {node.lineno}")
+        if isinstance(node, ast.Assign | ast.AugAssign | ast.AnnAssign):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for t in targets:
+                if isinstance(t, ast.Attribute) and isinstance(t.value, ast.Name) and t.value.id in core_names:
+                    bad.append(f"{t.value.id}.{t.attr} = ... at line {node.lineno}")
+                if isinstance(t, ast.Subscript) and ast.unparse(t.value) == "sys.modules":
+                    bad.append(f"sys.modules write at line {node.lineno}")
+    assert bad == [], bad
+
+
+def test_run_attach_view_resumes_prints_history_marks_terminal_and_runs_the_view():
+    import contextlib
+    import io
+    import types
+    snapshot = {"stored_session_id": A, "running": True, "execution_generation": 7, "messages": [
+        {"role": "user", "content": "ship it"},
+        {"role": "user", "content": "merged", "display_metadata": {"model_only": True}},
+        {"role": "tool", "content": "{}"},
+        {"role": "assistant", "content": "on it"},
+        {"role": "assistant", "content": None}]}
+
+    class Client:
+        def __init__(self):
+            self.calls = []
+
+        async def rpc(self, method, **params):
+            self.calls.append((method, params))
+            return snapshot
+
+    client = Client()
+
+    @contextlib.asynccontextmanager
+    async def connect_gateway():
+        yield client
+
+    class View:
+        made = []
+
+        def __init__(self, c, snap, **kw):
+            self.c, self.snap, self.kw = c, snap, kw
+            View.made.append(self)
+
+        async def run(self, query=None, *, oneshot=False):
+            self.ran = (query, oneshot)
+            return 0
+
+    crumbs = []
+
+    def run(mods):
+        setattr(mods["hermes_cli.gateway_client"], "connect_gateway", connect_gateway)  # noqa: B010
+        bc = types.ModuleType("hermes_cli.terminal_breadcrumbs")
+        setattr(bc, "write_breadcrumb", crumbs.append)  # noqa: B010
+        sys.modules["hermes_cli.terminal_breadcrumbs"] = bc
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = asyncio.run(live.run_attach_view(A, View))
+        finally:
+            sys.modules.pop("hermes_cli.terminal_breadcrumbs", None)
+        return code, out.getvalue(), err.getvalue()
+    code, out, err = _with_fake_core(run)
+    assert code == 0 and client.calls == [("session.resume", {"session_id": A})]
+    assert out.splitlines() == ["user: ship it", "assistant: on it"]
+    assert err.strip() == "Session: " + A and crumbs == [A]
+    (v,) = View.made
+    assert v.c is client and v.snap is snapshot and v.ran == (None, False)
+    assert v.kw == {"quiet": False, "emitter": None, "usage_file": None}
+    assert v.launch_api_key is None and v.unattended is False and v.resume_footer is False
+
+
+def test_write_breadcrumb_is_optional_on_builds_without_it():
+    saved = sys.modules.get("hermes_cli.terminal_breadcrumbs")
+    sys.modules["hermes_cli.terminal_breadcrumbs"] = None  # type: ignore[assignment]  # import -> ImportError
+    try:
+        live._write_breadcrumb(A)  # no raise
+    finally:
+        if saved is None:
+            sys.modules.pop("hermes_cli.terminal_breadcrumbs", None)
+        else:
+            sys.modules["hermes_cli.terminal_breadcrumbs"] = saved
 
 
 def test_launch_attach_falls_back_to_stock_view_when_hooks_moved():
@@ -565,9 +659,11 @@ def test_launch_attach_falls_back_to_stock_view_when_hooks_moved():
     def run(mods):
         mods["hermes_cli.gateway_chat_view"].GatewayChatView = Bare
         used = []
+        def no_run(_sid, _cls):
+            raise AssertionError("an unsupported viewer must take the stock path")
         assert live.launch_attach(A, launch=lambda o: used.append(
-            mods["hermes_cli.gateway_chat_view"].GatewayChatView) or 0) == 0
-        assert used == [Bare]
+            (o, mods["hermes_cli.gateway_chat_view"].GatewayChatView)) or 0, run=no_run) == 0
+        assert used == [({"resume": A}, Bare)]
     assert not live.attach_view_supported(Bare) and live.attach_view_supported(FakeBaseView)
     _with_fake_core(run)
 
