@@ -1,5 +1,5 @@
 name: live-session
-version: "1.1.0"
+version: "1.1.1"
 description: >-
   `hermes live {ls,steer,queue,attach,continue}`: see, steer, queue into, watch and keep running
   a session that another terminal owns (for example your SSH login from another PC), through the
