@@ -596,27 +596,63 @@ def attach_view_supported(base: Any) -> bool:
     return isinstance(base, type) and all(callable(getattr(base, name, None)) for name in ATTACH_VIEW_HOOKS)
 
 
-def launch_attach(sid: str, launch: Callable[[dict[str, Any]], int] = _gateway_launch) -> int:
-    """Run the gateway viewer with attach's view class, in THIS process only, for this call only.
+# A micro-compaction merge row (core: agent.context_compressor.MODEL_ONLY_DISPLAY_METADATA_KEY) is
+# not printed on resume; its original prompts are. Literal here so attach adds no core import.
+MODEL_ONLY_KEY = "model_only"
 
-    ``run_gateway_chat`` imports GatewayChatView from its module at call time, so the swap is seen
-    there; it is undone on every exit path. The gateway and every other terminal are untouched."""
-    import hermes_cli.gateway_chat as chat
-    import hermes_cli.gateway_chat_view as view_mod
-    base = view_mod.GatewayChatView
+
+def history_lines(snapshot: dict[str, Any] | None) -> list[str]:
+    """The transcript the stock viewer prints when it resumes a session (user/assistant text)."""
+    out = []
+    for row in (snapshot or {}).get("messages") or []:
+        meta = row.get("display_metadata")
+        merged = isinstance(meta, dict) and meta.get(MODEL_ONLY_KEY)
+        if row.get("role") in ("user", "assistant") and isinstance(row.get("content"), str) and not merged:
+            out.append(f"{row['role']}: {row['content']}")
+    return out
+
+
+def _write_breadcrumb(stored_id: str) -> None:
+    """Mark this terminal as viewing ``stored_id``, as `hermes chat` does on resume, so `ls` shows
+    the attached tty and `continue` defaults to it. Optional: a build without it just skips."""
+    try:
+        from hermes_cli.terminal_breadcrumbs import write_breadcrumb
+    except ImportError:
+        return
+    write_breadcrumb(stored_id)
+
+
+async def run_attach_view(sid: str, view_cls: type) -> int:
+    """Resume ``sid`` on the gateway and run ``view_cls`` on it.
+
+    This is the resume path of core's ``hermes_cli.gateway_chat.run_gateway_chat`` with the viewer
+    class passed in, instead of rebinding core's ``GatewayChatView`` (catalog rule 9: no runtime
+    overrides of core). ``session.resume`` never takes the classic CLI's terminal lease."""
+    from hermes_cli.gateway_client import connect_gateway
+    async with connect_gateway() as client:
+        snapshot = await client.rpc("session.resume", session_id=sid)
+        stored = snapshot["stored_session_id"]
+        print("Session: " + stored, file=sys.stderr, flush=True)
+        await asyncio.to_thread(_write_breadcrumb, stored)
+        view = view_cls(client, snapshot, quiet=False, emitter=None, usage_file=None)
+        view.launch_api_key = None
+        view.unattended = False
+        view.resume_footer = False
+        for line in history_lines(snapshot):
+            print(line)
+        return await view.run(None, oneshot=False)
+
+
+def launch_attach(sid: str, launch: Callable[[dict[str, Any]], int] = _gateway_launch,
+                  run: Callable[[str, type], Any] = run_attach_view) -> int:
+    """Run attach's subclass of the shipped gateway viewer on ``sid``. Nothing in core is replaced:
+    the subclass is constructed here. A build whose viewer lacks the hooks gets the stock view."""
+    from hermes_cli.gateway_chat_view import GatewayChatView as base
     if not attach_view_supported(base):
         print("hermes live: this Hermes build's viewer lacks the hooks attach needs; typed text will "
               "QUEUE (not steer). Use `hermes live steer` from another shell.", file=sys.stderr)
         return launch({"resume": sid})
-    patched = make_attach_view(base)
-    targets = [view_mod] + ([chat] if getattr(chat, "GatewayChatView", None) is base else [])
-    for mod in targets:
-        setattr(mod, "GatewayChatView", patched)  # noqa: B010 - module attrs are untyped to Pyright
-    try:
-        return launch({"resume": sid})
-    finally:
-        for mod in targets:
-            setattr(mod, "GatewayChatView", base)  # noqa: B010
+    return asyncio.run(run(sid, make_attach_view(base)))
 
 
 # ------------------------------------------------------------------------------ commands
@@ -773,6 +809,7 @@ UPDATE_HINT = ("this Hermes build predates the unified gateway runtime that `her
 REQUIRED_CORE = (
     ("hermes_cli.gateway_client", "connect_gateway"),
     ("hermes_cli.gateway_chat", "launch_from_kwargs"),
+    ("hermes_cli.gateway_chat_view", "GatewayChatView"),
     ("hermes_cli.active_sessions", "active_session_registry_snapshot"),
 )
 

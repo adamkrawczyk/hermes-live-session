@@ -103,11 +103,11 @@ then the same line as the next turn when nothing is running.
   `continue` resumes a paused goal. Nothing else is written.
 - **Core imports:** `hermes_cli.gateway_client`, `hermes_cli.gateway_chat` and
   `hermes_cli.active_sessions` are not documented plugin APIs yet, so `hermes plugins validate`
-  warns about them. The only rebinding: while `hermes live attach` runs, and only inside that
-  short-lived process, `hermes_cli.gateway_chat_view.GatewayChatView` names a subclass that adds
-  the steer-first routing. It is restored on every exit path. The gateway and other terminals are
-  untouched. On a build whose viewer lacks the hooks it needs, `attach` says so and uses the stock
-  view.
+  warns about them. Nothing in core is replaced or rebound: `attach` constructs its own subclass
+  of the shipped `GatewayChatView` and runs it on the resume path of core's
+  `run_gateway_chat` (`session.resume` → print history → `view.run`), entirely inside the
+  `hermes live attach` process. The gateway and other terminals are untouched. On a build whose
+  viewer lacks the hooks it needs, `attach` says so and uses the stock view.
 
 ## Retire when
 
