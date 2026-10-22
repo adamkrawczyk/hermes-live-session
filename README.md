@@ -26,9 +26,8 @@ exact session title.
     hermes plugins install adamkrawczyk/hermes-live-session --enable
     hermes live --help
 
-Requires a Hermes build with the unified gateway runtime (main after v0.22.2; the first release
-after v0.22.2 carries it). On an older build every command exits 1 with an "update Hermes"
-message and does nothing else. Linux and macOS.
+Requires a Hermes build with the unified gateway runtime (v0.22.2 or newer). On an older build every
+command exits 1 with an "update Hermes" message and does nothing else. Linux and macOS.
 
 ## Typical use
 
